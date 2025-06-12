@@ -1,4 +1,7 @@
 use crate::Result;
+use crate::utils::constants::{
+    DEFAULT_ALLOWED_PORT_RANGE, DEFAULT_MAX_CONNECTIONS, DEFAULT_RETRIES, DEFAULT_TIMEOUT,
+};
 use iroh::{NodeId, PublicKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
@@ -120,10 +123,18 @@ impl Default for ServerSettings {
 }
 
 fn default_max_connections() -> usize {
-    100
+    DEFAULT_MAX_CONNECTIONS
 }
 fn default_port_range() -> (u16, u16) {
-    (1024, 65535)
+    DEFAULT_ALLOWED_PORT_RANGE
+}
+
+fn default_timeout() -> u64 {
+    DEFAULT_TIMEOUT
+}
+
+fn default_retries() -> usize {
+    DEFAULT_RETRIES
 }
 
 impl Configuration for ServerConfig {
@@ -152,15 +163,6 @@ impl Configuration for ServerConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ClientConfig {
-    #[serde(default)]
-    pub hosts: Vec<Host>,
-
-    #[serde(default)]
-    pub settings: ClientSettings,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClientSettings {
     #[serde(default = "default_timeout")]
     pub connection_timeout: u64,
@@ -169,20 +171,21 @@ pub struct ClientSettings {
     pub max_retries: usize,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ClientConfig {
+    pub hosts: Vec<Host>,
+
+    #[serde(default)]
+    pub settings: ClientSettings,
+}
+
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
-            connection_timeout: default_timeout(),
-            max_retries: default_retries(),
+            connection_timeout: DEFAULT_TIMEOUT,
+            max_retries: DEFAULT_RETRIES,
         }
     }
-}
-
-fn default_timeout() -> u64 {
-    30
-}
-fn default_retries() -> usize {
-    5
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -237,7 +240,6 @@ impl Configuration for ClientConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        // Check for duplicate host names
         let mut names = std::collections::HashSet::new();
         for host in &self.hosts {
             if !names.insert(&host.name) {
@@ -266,12 +268,10 @@ impl HostManager {
     ) -> Result<()> {
         let mut config: ClientConfig = self.config_manager.load().await?;
 
-        // Check if name already exists
         if config.hosts.iter().any(|h| h.name == name) {
             return Err(crate::error!("Host with name '{}' already exists", name));
         }
 
-        // Check if ID already exists
         if let Some(existing) = config.hosts.iter().find(|h| h.id == id) {
             return Err(crate::error!(
                 "Node ID already exists with name '{}'",
@@ -381,10 +381,8 @@ impl AuthorizationManager {
     }
 }
 
-// Re-export for backward compatibility
 pub use self::{AuthorizationManager as Auth, ConfigManager as Manager, HostManager as Hosts};
 
-// Convenience functions for backward compatibility
 pub async fn load_config<C: Configuration>() -> Result<C> {
     let manager = ConfigManager::new()?;
     manager.load().await

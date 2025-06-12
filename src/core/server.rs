@@ -47,7 +47,6 @@ impl Server {
     pub async fn start(self, endpoint: Endpoint) -> Result<()> {
         let node_id = endpoint.node_id();
 
-        // Load initial config to validate
         let config: ServerConfig = self.config_manager.load().await?;
 
         if config.authorized_keys.is_empty() {
@@ -88,7 +87,6 @@ impl Server {
     async fn validate_connection(&self, conn: &Connection) -> Result<ConnectionState> {
         let remote_node_id = conn.remote_node_id()?;
 
-        // Check authorization
         if !self.auth_manager.is_authorized(&remote_node_id).await? {
             crate::warning!(
                 "Unauthorized connection attempt from node: {}",
@@ -98,16 +96,12 @@ impl Server {
             return Err(anyhow::anyhow!("Unauthorized connection").into());
         }
 
-        // Check connection limit
         self.check_connection_limit().await?;
 
-        // Read protocol
         let protocol = self.read_protocol(conn).await?;
 
-        // Read port
         let port = self.read_port(conn).await?;
 
-        // Validate port
         if !self.auth_manager.is_port_allowed(port).await? {
             crate::warning!(
                 "Invalid port requested by node {}: {}",
@@ -154,10 +148,8 @@ impl Server {
     async fn handle_connection(&self, conn: Connection) -> Result<()> {
         let remote_node_id = conn.remote_node_id()?;
 
-        // Increment active connection count
         self.active_connections.fetch_add(1, Ordering::Relaxed);
 
-        // Ensure we decrement on exit
         let _guard = ConnectionGuard {
             counter: Arc::clone(&self.active_connections),
             node_id: remote_node_id,
@@ -213,10 +205,8 @@ impl ProtocolHandler for Server {
             let conn = connecting.await?;
             let remote_node_id = conn.remote_node_id()?;
 
-            // Validate and get connection state
             let state = server.validate_connection(&conn).await?;
 
-            // Store state for later use
             server.connections.insert(remote_node_id, state);
 
             Ok(conn)

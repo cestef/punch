@@ -49,19 +49,15 @@ impl Client {
     }
 
     async fn resolve_node_id(&mut self, target: &str) -> Result<NodeId> {
-        // Check if it's a known host name
         if let Some(host) = self.config.hosts.iter().find(|h| h.name == target) {
             return Ok(host.id);
         }
 
-        // Try to parse as NodeId
         if let Ok(node_id) = target.parse::<NodeId>() {
-            // Check if we already know this NodeId
             if self.config.hosts.iter().any(|h| h.id == node_id) {
                 return Ok(node_id);
             }
 
-            // Ask to add new host
             if self.prompt_add_host(&node_id).await? {
                 self.add_host_interactive(node_id).await?;
             }
@@ -145,14 +141,12 @@ impl Client {
     ) -> Result<iroh::endpoint::Connection> {
         let conn = self.endpoint.connect(node_id, ALPN).await?;
 
-        // Send protocol and port information
         conn.send_datagram(bytes::Bytes::from(vec![protocol as u8]))?;
         conn.send_datagram(bytes::Bytes::copy_from_slice(&remote_port.to_be_bytes()))?;
 
-        // Wait a bit to see if connection gets closed immediately (authorization failure)
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Connection stayed open, likely authorized
+
                 Ok(conn)
             }
             _ = conn.closed() => {
@@ -180,7 +174,6 @@ impl Client {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        // Setup graceful shutdown on Ctrl+C
         let shutdown_signal = shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
@@ -215,7 +208,6 @@ impl Client {
         let tunnel = Arc::new(tunnel);
         let (tunnel_shutdown_tx, mut tunnel_shutdown_rx) = tokio::sync::watch::channel(false);
 
-        // Monitor tunnel connection status
         let tunnel_monitor = Arc::clone(&tunnel);
         let shutdown_monitor = tunnel_shutdown_tx.clone();
         tokio::spawn(async move {
@@ -225,7 +217,7 @@ impl Client {
 
         loop {
             tokio::select! {
-                // Check for Ctrl+C shutdown
+
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         crate::info!("Shutting down client...");
@@ -233,7 +225,7 @@ impl Client {
                     }
                 }
 
-                // Check for tunnel closure
+
                 _ = tunnel_shutdown_rx.changed() => {
                     if *tunnel_shutdown_rx.borrow() {
                         crate::warning!("Tunnel connection closed");
@@ -241,7 +233,7 @@ impl Client {
                     }
                 }
 
-                // Accept new connections
+
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, client_addr)) => {

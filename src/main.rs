@@ -78,7 +78,6 @@ async fn handle_hosts_command(
                 return Ok(());
             }
 
-            // Sort hosts by name
             let mut hosts = hosts;
             hosts.sort_by(|a, b| a.name.cmp(&b.name));
 

@@ -84,17 +84,15 @@ impl TunnelConnection {
 
     pub async fn handle_udp_socket(&self, socket: UdpSocket) -> Result<()> {
         let mut tunnel_stream = self.conn.open_uni().await?;
-        let mut buf = vec![0u8; 65536]; // 64KB buffer
+        let mut buf = vec![0u8; 64 * 1024]; // 64KB
 
         loop {
             tokio::select! {
-                // Monitor for connection closure
                 _ = self.conn.closed() => {
                     tracing::debug!("UDP tunnel connection closed");
                     break;
                 }
 
-                // Handle UDP packets
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((size, client_addr)) => {
@@ -135,7 +133,7 @@ impl TunnelConnection {
                 result = self.conn.accept_bi() => {
                     match result {
                         Ok((send, recv)) => {
-                            let handler = ConnectionHandler::new(0, self.protocol); // Port will be set by server
+                            let handler = ConnectionHandler::new(0, self.protocol);
                             tokio::spawn(async move {
                                 if let Err(e) = handler.handle_bidirectional_stream(send, recv).await {
                                     tracing::error!("Error handling bidirectional stream: {}", e);
@@ -152,7 +150,7 @@ impl TunnelConnection {
                 result = self.conn.accept_uni() => {
                     match result {
                         Ok(stream) => {
-                            let handler = ConnectionHandler::new(0, self.protocol); // Port will be set by server
+                            let handler = ConnectionHandler::new(0, self.protocol);
                             tokio::spawn(async move {
                                 if let Err(e) = handler.handle_unidirectional_stream(stream).await {
                                     tracing::error!("Error handling unidirectional stream: {}", e);
@@ -274,11 +272,11 @@ impl ConnectionHandler {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         socket.connect(addr).await?;
 
-        let mut buf = vec![0u8; 65536]; // 64KB buffer
+        let mut buf = vec![0u8; 65536];
 
         loop {
             match tunnel_stream.read(&mut buf).await {
-                Ok(0) => break, // EOF
+                Ok(0) => break,
                 Ok(size) => {
                     tracing::debug!("Forwarding {} bytes to UDP port {}", size, port);
                     if let Err(e) = socket.send(&buf[..size]).await {
