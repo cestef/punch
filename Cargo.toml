@@ -2,6 +2,10 @@
 name = "punch"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/cestef/punch"
+homepage = "https://github.com/cestef/punch"
+description = "Simple and fast peer-to-peer tunneling tool"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.98"
@@ -21,3 +25,8 @@ miette = { version = "7.6.0", features = ["fancy"] }
 inquire = "0.7.5"
 dashmap = "6.1.0"
 bytes = "1.10.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
