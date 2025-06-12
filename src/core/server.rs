@@ -1,229 +1,245 @@
-use std::sync::Arc;
-
-use crate::{CloseReason, Result, cli::Protocol, utils::reduced_node_id};
+use crate::utils::{
+    config::{AuthorizationManager, ConfigManager, ServerConfig},
+    constants::ALPN,
+    reduced_node_id,
+};
+use crate::{
+    CloseReason, Result,
+    core::{ConnectionHandler, Protocol, TunnelConnection},
+};
 use dashmap::DashMap;
 use iroh::{
-    Endpoint,
+    Endpoint, NodeId,
     endpoint::Connection,
     protocol::{ProtocolHandler, Router},
 };
 use n0_future::boxed::BoxFuture;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, Join},
-    net::TcpStream,
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::utils::{
-    config::{ServerConfig, load_config},
-    constants::ALPN,
-};
-
-pub async fn server(endpoint: Endpoint) -> Result<()> {
-    let config: ServerConfig = load_config("server.toml").await?;
-    let node_id = endpoint.node_id();
-    let router = Router::builder(endpoint)
-        .accept(
-            ALPN,
-            Tunnel {
-                config: Arc::new(config),
-                states: Arc::new(DashMap::new()),
-            },
-        )
-        .spawn();
-
-    crate::info!(
-        "Server started, connect to it at: {}",
-        node_id.to_string().blue().bold()
-    );
-
-    tokio::signal::ctrl_c().await?;
-
-    router.shutdown().await?;
-    Ok(())
+#[derive(Clone, Debug)]
+pub struct Server {
+    config_manager: Arc<ConfigManager>,
+    auth_manager: Arc<AuthorizationManager>,
+    connections: Arc<DashMap<NodeId, ConnectionState>>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
-struct Tunnel {
-    config: Arc<ServerConfig>,
-    states: Arc<DashMap<iroh::NodeId, State>>,
+struct ConnectionState {
+    port: u16,
+    protocol: Protocol,
 }
 
-#[derive(Debug, Clone)]
-struct State {
-    requested_port: u16,
-    requested_protocol: Protocol,
+impl Server {
+    pub async fn new() -> Result<Self> {
+        let config_manager = Arc::new(ConfigManager::new()?);
+        let auth_manager = Arc::new(AuthorizationManager::new((*config_manager).clone()));
+
+        Ok(Self {
+            config_manager,
+            auth_manager,
+            connections: Arc::new(DashMap::new()),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub async fn start(self, endpoint: Endpoint) -> Result<()> {
+        let node_id = endpoint.node_id();
+
+        // Load initial config to validate
+        let config: ServerConfig = self.config_manager.load().await?;
+
+        if config.authorized_keys.is_empty() {
+            crate::warning!("No authorized keys configured. No clients will be able to connect.");
+            crate::info!("Add authorized keys to {}", "~/.punch/server.toml".bold());
+        }
+
+        let router = Router::builder(endpoint).accept(ALPN, self).spawn();
+
+        crate::info!(
+            "Server started, connect to it at: {}",
+            node_id.to_string().blue().bold()
+        );
+
+        tokio::signal::ctrl_c().await?;
+
+        crate::info!("Shutting down server...");
+        router.shutdown().await?;
+
+        Ok(())
+    }
+
+    async fn check_connection_limit(&self) -> Result<()> {
+        let config: ServerConfig = self.config_manager.load().await?;
+        let current = self.active_connections.load(Ordering::Relaxed);
+
+        if current >= config.settings.max_connections {
+            return Err(anyhow::anyhow!(
+                "Maximum connections ({}) reached",
+                config.settings.max_connections
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    async fn validate_connection(&self, conn: &Connection) -> Result<ConnectionState> {
+        let remote_node_id = conn.remote_node_id()?;
+
+        // Check authorization
+        if !self.auth_manager.is_authorized(&remote_node_id).await? {
+            crate::warning!(
+                "Unauthorized connection attempt from node: {}",
+                reduced_node_id(&remote_node_id)
+            );
+            CloseReason::Unauthorized.execute(conn);
+            return Err(anyhow::anyhow!("Unauthorized connection").into());
+        }
+
+        // Check connection limit
+        self.check_connection_limit().await?;
+
+        // Read protocol
+        let protocol = self.read_protocol(conn).await?;
+
+        // Read port
+        let port = self.read_port(conn).await?;
+
+        // Validate port
+        if !self.auth_manager.is_port_allowed(port).await? {
+            crate::warning!(
+                "Invalid port requested by node {}: {}",
+                reduced_node_id(&remote_node_id),
+                port
+            );
+            CloseReason::InvalidPort.execute(conn);
+            return Err(anyhow::anyhow!("Port {} not allowed", port).into());
+        }
+
+        tracing::info!(
+            "Connection request from node: {}, protocol: {:?}, port: {}",
+            reduced_node_id(&remote_node_id),
+            protocol,
+            port
+        );
+
+        Ok(ConnectionState { port, protocol })
+    }
+
+    async fn read_protocol(&self, conn: &Connection) -> Result<Protocol> {
+        let datagram = conn.read_datagram().await?;
+        let first_byte = datagram
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Failed to read protocol from datagram"))?;
+
+        Protocol::try_from(*first_byte).map_err(|_| {
+            CloseReason::InvalidProtocol.execute(conn);
+            anyhow::anyhow!("Invalid protocol requested").into()
+        })
+    }
+
+    async fn read_port(&self, conn: &Connection) -> Result<u16> {
+        let datagram = conn.read_datagram().await?;
+
+        let port_bytes: [u8; 2] = datagram.iter().as_slice().try_into().map_err(|_| {
+            CloseReason::InvalidPort.execute(conn);
+            anyhow::anyhow!("Invalid port bytes")
+        })?;
+
+        Ok(u16::from_be_bytes(port_bytes))
+    }
+
+    async fn handle_connection(&self, conn: Connection) -> Result<()> {
+        let remote_node_id = conn.remote_node_id()?;
+
+        // Increment active connection count
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+
+        // Ensure we decrement on exit
+        let _guard = ConnectionGuard {
+            counter: Arc::clone(&self.active_connections),
+            node_id: remote_node_id,
+            connections: Arc::clone(&self.connections),
+        };
+
+        let state = self
+            .connections
+            .get(&remote_node_id)
+            .ok_or_else(|| anyhow::anyhow!("Connection state not found"))?;
+
+        let tunnel = TunnelConnection::new(conn, state.protocol);
+        let handler = ConnectionHandler::new(state.port, state.protocol);
+
+        tracing::info!(
+            "Handling connection from node: {} on port {}",
+            reduced_node_id(&remote_node_id),
+            state.port
+        );
+
+        handler.handle_connection(tunnel).await?;
+
+        Ok(())
+    }
 }
 
-impl ProtocolHandler for Tunnel {
+struct ConnectionGuard {
+    counter: Arc<AtomicUsize>,
+    node_id: NodeId,
+    connections: Arc<DashMap<NodeId, ConnectionState>>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.connections.remove(&self.node_id);
+        tracing::debug!(
+            "Connection closed for node: {}, active connections: {}",
+            reduced_node_id(&self.node_id),
+            self.counter.load(Ordering::Relaxed)
+        );
+    }
+}
+
+impl ProtocolHandler for Server {
     fn on_connecting(
         &self,
         connecting: iroh::endpoint::Connecting,
     ) -> BoxFuture<anyhow::Result<Connection>> {
-        let config = self.config.clone();
-        let states = self.states.clone();
+        let server = self.clone();
+
         Box::pin(async move {
-            let connecting = connecting.await?;
-            let remote_node_id = connecting.remote_node_id()?;
-            if !config.authorized_keys.contains(&remote_node_id) {
-                tracing::warn!(
-                    "Unauthorized connection attempt from node: {}",
-                    reduced_node_id(&remote_node_id)
-                );
-                CloseReason::Unauthorized.execute(&connecting);
-                return Err(anyhow::anyhow!("Unauthorized connection"));
-            }
-            let datagram = connecting.read_datagram().await?;
-            let requested_protocol = datagram.first().ok_or(anyhow::anyhow!(
-                "Failed to read requested protocol from datagram"
-            ))?;
-            let requested_protocol = match requested_protocol {
-                0x00 => Protocol::Tcp,
-                0x01 => Protocol::Udp,
-                _ => {
-                    tracing::warn!(
-                        "Invalid protocol requested by node {}: {}",
-                        reduced_node_id(&remote_node_id),
-                        requested_protocol
-                    );
-                    CloseReason::InvalidProtocol.execute(&connecting);
-                    return Err(anyhow::anyhow!("Invalid protocol requested"));
-                }
-            };
-            tracing::info!(
-                "Connection request from node: {}, requested protocol: {:?}",
-                reduced_node_id(&remote_node_id),
-                requested_protocol
-            );
+            let conn = connecting.await?;
+            let remote_node_id = conn.remote_node_id()?;
 
-            let requested_port = connecting.read_datagram().await?; // Bytes
-            let requested_port =
-                u16::from_be_bytes(requested_port.iter().as_slice().try_into().map_err(|_| {
-                    tracing::warn!(
-                        "Failed to convert requested port bytes: {:?}",
-                        requested_port
-                    );
-                    CloseReason::InvalidPort.execute(&connecting);
-                    anyhow::anyhow!("Invalid port bytes")
-                })?);
+            // Validate and get connection state
+            let state = server.validate_connection(&conn).await?;
 
-            tracing::info!(
-                "Connection request from node: {}, requested port: {}",
-                reduced_node_id(&remote_node_id),
-                requested_port
-            );
+            // Store state for later use
+            server.connections.insert(remote_node_id, state);
 
-            if requested_port < 1024 {
-                // >65535 can not be reached as we use u16
-                tracing::warn!(
-                    "Invalid port requested by node {}: {}",
-                    reduced_node_id(&remote_node_id),
-                    requested_port
-                );
-                CloseReason::InvalidPort.execute(&connecting);
-                return Err(anyhow::anyhow!("Invalid port requested"));
-            }
-
-            tracing::info!("Connecting to node: {}", reduced_node_id(&remote_node_id));
-
-            let state = State {
-                requested_port,
-                requested_protocol,
-            };
-            states.insert(remote_node_id, state);
-            Ok(connecting)
+            Ok(conn)
         })
     }
 
-    fn accept(&self, tunnel_conn: Connection) -> BoxFuture<anyhow::Result<()>> {
-        let _config = self.config.clone();
-        let states = self.states.clone();
+    fn accept(&self, conn: Connection) -> BoxFuture<anyhow::Result<()>> {
+        let server = self.clone();
+
         Box::pin(async move {
-            let client_node_id = tunnel_conn.remote_node_id()?;
+            let remote_node_id = conn.remote_node_id()?;
+
             tracing::info!(
                 "Accepted tunnel connection from node: {}",
-                reduced_node_id(&client_node_id)
+                reduced_node_id(&remote_node_id)
             );
 
-            loop {
-                let states = states.clone();
-                tokio::select! {
-                    biased;
-
-                    // Wait for the connection to close
-                    _ = tunnel_conn.closed() => {
-                        tracing::info!("Tunnel connection closed for node: {}", reduced_node_id(&client_node_id));
-                        break;
-                    }
-
-                    stream = tunnel_conn.accept_uni() => {
-                        match stream {
-                            Ok(tunnel_stream) => {
-                                tokio::spawn(async move {
-                                    let state = states.get(&client_node_id).ok_or_else(|| {
-                                        tracing::warn!(
-                                            "State for node {} not found",
-                                            reduced_node_id(&client_node_id)
-                                        );
-                                        anyhow::anyhow!("State not found")
-                                    })?;
-                                    tracing::info!(
-                                        "Handling unidirectional stream for node: {}, requested port: {}",
-                                        reduced_node_id(&client_node_id),
-                                        state.requested_port
-                                    );
-                                    if let Err(e) = handle_uni_stream(
-                                        tunnel_stream,
-                                        state.value(),
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!("Error handling unidirectional stream: {}", e);
-                                    }
-                                    anyhow::Ok(())
-                                });
-                            }
-                            Err(e) => {
-                                tracing::info!("Connection closed: {}", e);
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-
-                    stream = tunnel_conn.accept_bi() => {
-                        match stream {
-                            Ok((tunnel_send, tunnel_recv)) => {
-                                tokio::spawn(async move {
-                                    let state = states.get(&client_node_id).ok_or_else(|| {
-                                        tracing::warn!(
-                                            "State for node {} not found",
-                                            reduced_node_id(&client_node_id)
-                                        );
-                                        anyhow::anyhow!("State not found")
-                                    })?;
-                                    tracing::info!(
-                                        "Handling stream for node: {}, requested port: {}",
-                                        reduced_node_id(&client_node_id),
-                                        state.requested_port
-                                    );
-                                    if let Err(e) = handle_bi_stream(
-                                        tokio::io::join(tunnel_recv, tunnel_send),
-                                        state.value(),
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!("Error handling stream: {}", e);
-                                    }
-                                    anyhow::Ok(())
-                                });
-                            }
-                            Err(e) => {
-                                tracing::info!("Connection closed: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
+            if let Err(e) = server.handle_connection(conn).await {
+                tracing::error!(
+                    "Error handling connection from {}: {}",
+                    reduced_node_id(&remote_node_id),
+                    e
+                );
             }
 
             Ok(())
@@ -231,52 +247,7 @@ impl ProtocolHandler for Tunnel {
     }
 }
 
-async fn handle_bi_stream(
-    mut tunnel_stream: Join<impl AsyncRead + Unpin, impl AsyncWrite + Unpin>,
-    state: &State,
-) -> Result<()> {
-    match state.requested_protocol {
-        Protocol::Tcp => {
-            let mut local_tcp_conn =
-                TcpStream::connect(format!("127.0.0.1:{}", state.requested_port)).await?;
-
-            tokio::io::copy_bidirectional(&mut tunnel_stream, &mut local_tcp_conn).await?;
-        }
-        Protocol::Udp => {}
-    }
-
-    tracing::info!("Stream for port {} closed", state.requested_port);
-    Ok(())
-}
-
-async fn handle_uni_stream(mut tunnel_stream: impl AsyncRead + Unpin, state: &State) -> Result<()> {
-    match state.requested_protocol {
-        Protocol::Tcp => {}
-        Protocol::Udp => {
-            use tokio::net::UdpSocket;
-
-            let socket = UdpSocket::bind("127.0.0.1:0").await?; // Bind to a random port
-            socket
-                .connect(format!("127.0.0.1:{}", state.requested_port))
-                .await?;
-            use tokio::io::AsyncReadExt;
-            let mut buf = [0; 65536]; // 64KB buffer for UDP packets
-            while let Ok(size) = tunnel_stream.read(&mut buf).await {
-                if size == 0 {
-                    break; // EOF
-                }
-                let data = &mut buf[..size];
-                tracing::debug!("Received {} bytes from tunnel stream for UDP", size);
-                if let Err(e) = socket.send(data).await {
-                    tracing::error!("Failed to send UDP packet: {}", e);
-                    break;
-                }
-            }
-        }
-    }
-    tracing::info!(
-        "Unidirectional stream for port {} closed",
-        state.requested_port
-    );
-    Ok(())
+pub async fn server(endpoint: Endpoint) -> Result<()> {
+    let server = Server::new().await?;
+    server.start(endpoint).await
 }

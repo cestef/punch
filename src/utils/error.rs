@@ -34,6 +34,10 @@ pub enum PunchError {
     #[diagnostic(code(punch::connection))]
     Connection(#[from] iroh::endpoint::ConnectionError),
 
+    #[error("Connection closed by remote peer: {reason}")]
+    #[diagnostic(code(punch::connection_closed))]
+    ConnectionClosed { reason: CloseReason },
+
     #[error(transparent)]
     Inquire(#[from] inquire::InquireError),
 
@@ -49,10 +53,12 @@ pub enum PunchError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
     Unauthorized,
     InvalidPort,
     InvalidProtocol,
+    Unknown,
 }
 
 impl Into<VarInt> for &CloseReason {
@@ -61,6 +67,18 @@ impl Into<VarInt> for &CloseReason {
             CloseReason::Unauthorized => VarInt::from(0x01 as u8),
             CloseReason::InvalidPort => VarInt::from(0x02 as u8),
             CloseReason::InvalidProtocol => VarInt::from(0x03 as u8),
+            CloseReason::Unknown => VarInt::from(u8::MAX), // Use a sentinel value for unknown
+        }
+    }
+}
+
+impl From<VarInt> for CloseReason {
+    fn from(value: VarInt) -> Self {
+        match value.into_inner() {
+            0x01 => CloseReason::Unauthorized,
+            0x02 => CloseReason::InvalidPort,
+            0x03 => CloseReason::InvalidProtocol,
+            _ => panic!("Unknown CloseReason: {}", value),
         }
     }
 }
@@ -75,6 +93,7 @@ impl std::fmt::Display for CloseReason {
             CloseReason::InvalidProtocol => {
                 write!(f, "Invalid protocol requested, must be TCP or UDP")
             }
+            CloseReason::Unknown => write!(f, "Unknown close reason"),
         }
     }
 }
